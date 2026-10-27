@@ -1,0 +1,22 @@
+{
+  "name": "apiaberta-gtfs",
+  "version": "1.0.0",
+  "description": "Unified GTFS schedules connector for API Aberta (Carris Metropolitana, Metro Lisboa, CP, Fertagus, Metro do Porto, STCP)",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "test": "node scripts/syntax-check.js && node --test test/*.test.js"
+  },
+  "dependencies": {
+    "csv-parse": "^6.1.0",
+    "fastify": "^5.0.0",
+    "mongoose": "^8.0.0",
+    "node-cron": "^3.0.0",
+    "pino-pretty": "^13.0.0",
+    "yauzl": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
