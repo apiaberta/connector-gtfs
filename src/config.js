@@ -21,6 +21,7 @@ export const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000
 export const INGEST_TIMEOUT_MS = 20 * 60 * 1000
 export const CHILD_MAX_OLD_SPACE = 384
 export const WRITE_BATCH = 1000
+export const DEPARTURE_WRITE_BATCH = 500
 export const DEPARTURE_SPLIT = 5000
 export const ZIP_RETENTION_MS = 3 * 24 * 60 * 60 * 1000
 export const HEAP_SOFT_LIMIT = 280 * 1024 * 1024
