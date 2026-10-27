@@ -1,0 +1,13 @@
+{
+  "resources": [
+    { "name": "GTFS Metro do Porto 07-2022", "format": "GTFS", "url": "https://example.test/gtfs_metro_07_22.zip", "created": "2026-09-04T12:48:45.538106" },
+    { "name": "GTFS Metro do Porto 11-09-2023", "format": "GTFS", "url": "https://example.test/gtfs_mdp_11_09_2023.zip", "created": "2026-09-04T12:48:46.600199" },
+    { "name": "GTFS Metro do Porto 08-04-2024", "format": "GTFS", "url": "https://example.test/horarios_gtfs_08_04_2024.zip", "created": "2026-09-04T12:48:47.522148" },
+    { "name": "GTFS Metro do Porto 06-09-2024", "format": "GTFS", "url": "https://example.test/horarios_gtfs_09_09_2024.zip", "created": "2026-09-04T12:48:48.309978" },
+    { "name": "GTFS Metro do Porto (Fonte) - Mais Recente", "format": "url", "url": "https://www.metrodoporto.pt/pages/337", "created": "2026-09-04T12:48:48.520300" },
+    { "name": "GTFS Metro do Porto 20-02-2026", "format": "ZIP", "url": "https://example.test/2026-02-20.zip", "created": "2026-09-04T12:48:50.254664" },
+    { "name": "GTFS Metro do Porto 07-04-2026", "format": "ZIP", "url": "https://example.test/2026-04-07.zip", "created": "2026-09-04T12:48:51.323540" },
+    { "name": "GTFS Metro do Porto 17-07-2026", "format": "ZIP", "url": "https://example.test/horarios_gtfs_mdp_17_07_2026.zip", "created": "2026-09-04T12:48:51.921345" },
+    { "name": "GTFS Metro do Porto 07-09-2026", "format": "ZIP", "url": "https://dadosabertos.cm-porto.pt/download/horarios_gtfs_mdp_07_09_2026.zip", "created": "2026-09-04T12:48:49.306853" }
+  ]
+}
