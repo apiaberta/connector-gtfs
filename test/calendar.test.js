@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { activeServices } from '../src/calendar.js'
+import { activeServices, addCalendarToServices, addCalendarDateToServices, emptyByDate } from '../src/calendar.js'
 
 const calendars = [
   {
@@ -45,5 +45,15 @@ describe('activeServices', () => {
   it('ignores services outside their date range', () => {
     const s = activeServices('2025-12-31', calendars, [])
     assert.equal(s.size, 0)
+  })
+
+  it('streams calendars into a window map without keeping the row arrays', () => {
+    const dates = ['2026-10-21', '2026-10-26']
+    const byDate = emptyByDate(dates)
+    for (const cal of calendars) addCalendarToServices(cal, dates, byDate)
+    for (const row of exceptions) addCalendarDateToServices(row, byDate)
+    assert.deepEqual([...byDate.get('2026-10-21')].sort(), ['WEEK'])
+    assert.equal(byDate.get('2026-10-26').has('WEEK'), false)
+    assert.equal(byDate.get('2026-10-26').has('SPECIAL'), true)
   })
 })

@@ -2,6 +2,7 @@ import { parsePagination, pageResult } from './pagination.js'
 import { formatHhMm, lisbonHm, lisbonYmd } from './time.js'
 import { isDateInWindow, windowRange } from './window.js'
 import { enabledFeeds, getFeedDef } from './feeds.js'
+import { flattenDepartureDocs, hydrateFlat } from './departures-read.js'
 
 export class QueryError extends Error {
   constructor(message, statusCode = 400, extra) {
@@ -68,15 +69,6 @@ function publicStop(s) {
     wheelchair_boarding: s.wheelchair_boarding,
     municipality_name: s.municipality_name || undefined
   }
-}
-
-function flattenDeps(docs) {
-  const out = []
-  for (const d of docs || []) {
-    for (const dep of d.deps || []) out.push(dep)
-  }
-  out.sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0))
-  return out
 }
 
 function formatDep(dep) {
@@ -179,7 +171,7 @@ export async function gtfsRoutes(app) {
   }, async (req, reply) => {
     const route = await store().getRoute(req.params.feed_id, req.params.route_id)
     if (!route) return reply.code(404).send({ error: 'Route not found' })
-    const [pattern, tripRows] = await Promise.all([
+    const [pattern, tripsToday] = await Promise.all([
       store().getRouteStops(req.params.feed_id, req.params.route_id),
       store().tripsToday(req.params.feed_id, req.params.route_id)
     ])
@@ -193,7 +185,7 @@ export async function gtfsRoutes(app) {
     return {
       ...publicRoute(route),
       stops,
-      trips_today: tripRows.length
+      trips_today: Number(tripsToday) || 0
     }
   })
 
@@ -288,10 +280,11 @@ export async function gtfsRoutes(app) {
     if (from && /^\d{2}:\d{2}$/.test(from)) from = `${from}:00`
 
     const docs = await store().getDepartures(req.params.feed_id, req.params.stop_id, date)
-    let deps = flattenDeps(docs)
+    let deps = flattenDepartureDocs(docs)
     if (from) deps = deps.filter((d) => d.t >= from)
     if (req.query.route_id) deps = deps.filter((d) => d.route_id === req.query.route_id)
     deps = deps.slice(0, limit)
+    deps = await hydrateFlat(deps, store())
 
     const expired = Boolean(feed?.expired)
     const body = {
@@ -337,22 +330,25 @@ export async function gtfsRoutes(app) {
     const stops = await store().nearStops(lat, lon, radius, 25)
     const docs = await store().departuresForStops(stops, date)
     const stopMeta = new Map(stops.map((s) => [`${s.feed_id}:${s.stop_id}`, s]))
-    const merged = []
-    for (const doc of docs) {
-      const stop = stopMeta.get(`${doc.feed_id}:${doc.stop_id}`)
-      for (const dep of doc.deps || []) {
-        if (dep.t < from) continue
-        merged.push({
-          feed_id: doc.feed_id,
-          stop_id: doc.stop_id,
-          stop_name: stop?.stop_name,
-          lat: stop?.lat,
-          lon: stop?.lon,
-          ...formatDep(dep)
-        })
+    let merged = flattenDepartureDocs(docs).filter((d) => d.t >= from)
+    merged.sort((a, b) => {
+      const at = a.ts instanceof Date ? a.ts.toISOString() : String(a.ts || '')
+      const bt = b.ts instanceof Date ? b.ts.toISOString() : String(b.ts || '')
+      return at < bt ? -1 : at > bt ? 1 : 0
+    })
+    merged = merged.slice(0, limit)
+    merged = await hydrateFlat(merged, store())
+    const data = merged.map((dep) => {
+      const stop = stopMeta.get(`${dep.feed_id}:${dep.stop_id}`)
+      return {
+        feed_id: dep.feed_id,
+        stop_id: dep.stop_id,
+        stop_name: stop?.stop_name,
+        lat: stop?.lat,
+        lon: stop?.lon,
+        ...formatDep(dep)
       }
-    }
-    merged.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0))
-    return { count: Math.min(merged.length, limit), data: merged.slice(0, limit) }
+    })
+    return { count: data.length, data }
   })
 }

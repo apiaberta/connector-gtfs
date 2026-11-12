@@ -7,8 +7,9 @@ import { miniGtfsZip } from './helpers/zip.js'
 import { collectZipCsv, listZipEntries, validateGtfsZip } from '../src/ingest/zip.js'
 import {
   tripFromRow, indexActiveTrips, collectStopDepartures,
-  iterStopDepartures, flushDepartureDocs
+  iterStopDepartures, flushDepartureDocs, buildAndFlushDepartures
 } from '../src/ingest/departures.js'
+import { unpackDep } from '../src/departures-read.js'
 import { servicesByDate } from '../src/calendar.js'
 import { yyyymmddToIso } from '../src/time.js'
 import { DEPARTURE_WRITE_BATCH } from '../src/config.js'
@@ -17,14 +18,32 @@ const zipPath = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'mini-
 
 function collectDocs(opts) {
   const docs = []
-  const routeStops = []
   let stopTimesWindow = 0
   for (const item of iterStopDepartures(opts)) {
     docs.push(...item.docs)
-    routeStops.push({ stop_id: item.stopId, route_ids: [...item.routeIds] })
     stopTimesWindow += item.stopTimes
   }
-  return { docs, routeStops, stopTimesWindow }
+  return { docs, stopTimesWindow }
+}
+
+function mockDeparture() {
+  const inserted = []
+  const batchSizes = []
+  let live = 0
+  let maxLive = 0
+  return {
+    inserted,
+    batchSizes,
+    maxLive: () => maxLive,
+    deleteMany: async () => {},
+    bulkWrite: async (ops) => {
+      live += ops.length
+      maxLive = Math.max(maxLive, live)
+      batchSizes.push(ops.length)
+      for (const op of ops) inserted.push(op.insertOne.document)
+      live -= ops.length
+    }
+  }
 }
 
 describe('departures builder (mini GTFS)', () => {
@@ -70,23 +89,22 @@ describe('departures builder (mini GTFS)', () => {
       activeTrips: active,
       dates
     })
-    const routesById = new Map(routeRows.map((r) => [r.route_id, r]))
     const { docs, stopTimesWindow } = collectDocs({
       feedId: 'mini',
-      byStop,
-      activeTrips: active,
-      routesById
+      byStop
     })
 
     assert.equal(byStop.size, 0)
     assert.equal(stopTimesWindow, 2)
     const stopB = docs.find((d) => d.stop_id === 'B')
     assert.ok(stopB)
-    assert.equal(stopB.deps[0].t, '25:10:00')
-    assert.equal(stopB.deps[0].trip_id, 'T3')
-    assert.equal(stopB.deps[0].route_id, 'R2')
-    assert.equal(stopB.deps[0].ts.toISOString(), '2026-10-27T01:10:00.000Z')
+    const first = unpackDep(stopB.deps[0])
+    assert.equal(first.t, '25:10:00')
+    assert.equal(first.trip_id, 'T3')
+    assert.equal(first.route_id, 'R2')
+    assert.equal(typeof stopB.deps[0], 'string')
     assert.ok(routeStops.some((r) => r.route_id === 'R2' && r.stop_ids[0] === 'B'))
+    assert.equal(routeRows.length, 2)
   })
 
   it('keeps WEEK trips on a Wednesday', async () => {
@@ -106,64 +124,34 @@ describe('departures builder (mini GTFS)', () => {
     const { byStop } = await collectStopDepartures({ zipPath, activeTrips: active, dates })
     const { docs } = collectDocs({
       feedId: 'mini',
-      byStop,
-      activeTrips: active,
-      routesById: new Map()
+      byStop
     })
     const stopA = docs.find((d) => d.stop_id === 'A')
-    assert.equal(stopA.deps[0].t, '08:00:00')
-    assert.equal(docs.find((d) => d.stop_id === 'B' && d.deps[0].t === '25:10:00'), undefined)
+    assert.equal(unpackDep(stopA.deps[0]).t, '08:00:00')
+    assert.equal(docs.find((d) => d.stop_id === 'B' && unpackDep(d.deps[0]).t === '25:10:00'), undefined)
   })
 })
 
 describe('departure flush memory bounds', () => {
-  it('releases each stop and never insertMany-s more than the write batch', async () => {
+  it('releases each stop and never bulkWrite-s more than the write batch', async () => {
     const stops = 1200
     const depsPerStop = 20
     const byStop = new Map()
-    const activeTrips = new Map()
-    for (let j = 0; j < depsPerStop; j++) {
-      activeTrips.set(`T${j}`, {
-        route_id: 'R1',
-        headsign: 'X',
-        direction_id: 0,
-        dates: ['2026-10-27']
-      })
-    }
     for (let i = 0; i < stops; i++) {
       const packed = []
       for (let j = 0; j < depsPerStop; j++) {
-        packed.push(`08:${String(j).padStart(2, '0')}:00\tT${j}`)
+        packed.push(`08:${String(j).padStart(2, '0')}:00\tT${j}\tR1`)
       }
       byStop.set(`S${i}`, new Map([['2026-10-27', packed]]))
     }
 
-    const batchSizes = []
-    let live = 0
-    let maxLive = 0
-    const Departure = {
-      deleteMany: async () => {},
-      insertMany: async (docs) => {
-        live += docs.length
-        maxLive = Math.max(maxLive, live)
-        batchSizes.push(docs.length)
-        live -= docs.length
-      }
-    }
-    const StopRoute = {
-      deleteMany: async () => {},
-      insertMany: async () => {}
-    }
-
+    const Departure = mockDeparture()
     const heapBefore = process.memoryUsage().heapUsed
     const { stopTimesWindow, maxBatch } = await flushDepartureDocs({
       Departure,
-      StopRoute,
       feedId: 'mini',
       dates: ['2026-10-27'],
       byStop,
-      activeTrips,
-      routesById: new Map([['R1', { route_short_name: '1' }]]),
       batchSize: DEPARTURE_WRITE_BATCH
     })
     const heapAfter = process.memoryUsage().heapUsed
@@ -171,30 +159,95 @@ describe('departure flush memory bounds', () => {
     assert.equal(byStop.size, 0)
     assert.equal(stopTimesWindow, stops * depsPerStop)
     assert.ok(maxBatch <= DEPARTURE_WRITE_BATCH + 1)
-    assert.ok(batchSizes.every((n) => n <= DEPARTURE_WRITE_BATCH + 1))
-    assert.ok(maxLive <= DEPARTURE_WRITE_BATCH + 1)
-    // Expanding every stop at once would add tens of MB; a 500-doc batch must not.
+    assert.ok(Departure.batchSizes.every((n) => n <= DEPARTURE_WRITE_BATCH + 1))
+    assert.ok(Departure.maxLive() <= DEPARTURE_WRITE_BATCH + 1)
+    assert.equal(typeof Departure.inserted[0].deps[0], 'string')
     const extraMB = (heapAfter - heapBefore) / 1024 / 1024
     assert.ok(extraMB < 40, `flush grew heap by ${extraMB.toFixed(1)}MB`)
   })
 
   it('iterStopDepartures deletes the stop before yielding the next', () => {
     const byStop = new Map([
-      ['A', new Map([['2026-10-27', ['08:00:00\tT1']]])],
-      ['B', new Map([['2026-10-27', ['08:10:00\tT1']]])]
+      ['A', new Map([['2026-10-27', ['08:00:00\tT1\tR1']]])],
+      ['B', new Map([['2026-10-27', ['08:10:00\tT1\tR1']]])]
     ])
-    const activeTrips = new Map([['T1', { route_id: 'R1', headsign: '', direction_id: 0, dates: ['2026-10-27'] }]])
     const seen = []
     for (const item of iterStopDepartures({
       feedId: 'mini',
-      byStop,
-      activeTrips,
-      routesById: new Map()
+      byStop
     })) {
       seen.push(item.stopId)
       assert.equal(byStop.has(item.stopId), false)
     }
     assert.deepEqual(seen.sort(), ['A', 'B'])
     assert.equal(byStop.size, 0)
+  })
+
+  it('continues part numbers across mid-stream flushes', async () => {
+    const nextPart = new Map()
+    const Departure = mockDeparture()
+    await flushDepartureDocs({
+      Departure,
+      feedId: 'mini',
+      dates: ['2026-10-27'],
+      byStop: new Map([['A', new Map([['2026-10-27', ['08:00:00\tT1\tR1']]])]]),
+      nextPart
+    })
+    await flushDepartureDocs({
+      Departure,
+      feedId: 'mini',
+      dates: ['2026-10-27'],
+      byStop: new Map([['A', new Map([['2026-10-27', ['09:00:00\tT2\tR1']]])]]),
+      deleteDates: false,
+      nextPart
+    })
+    const parts = Departure.inserted.filter((d) => d.stop_id === 'A').map((d) => d.part)
+    assert.deepEqual(parts, [0, 1])
+  })
+})
+
+describe('buildAndFlushDepartures periodic flush', () => {
+  before(async () => {
+    await mkdir(dirname(zipPath), { recursive: true })
+    await writeFile(zipPath, miniGtfsZip())
+  })
+
+  it('flushes packed docs via the callback and returns stop-route lookups', async () => {
+    const [calRows, tripRows] = await Promise.all([
+      collectZipCsv(zipPath, 'calendar.txt'),
+      collectZipCsv(zipPath, 'trips.txt')
+    ])
+    const calendars = calRows.map((r) => ({
+      ...r,
+      start_date: yyyymmddToIso(r.start_date),
+      end_date: yyyymmddToIso(r.end_date)
+    }))
+    const dates = ['2026-10-21']
+    const byDate = servicesByDate(dates, calendars, [])
+    const active = indexActiveTrips(tripRows.map(tripFromRow), byDate)
+    const Departure = mockDeparture()
+    const flushed = []
+    const { stopTimesWindow, stopRouteAcc } = await buildAndFlushDepartures({
+      zipPath,
+      activeTrips: active,
+      dates,
+      replaceLookups: true,
+      flush: async ({ byStop, deleteDates, nextPart }) => {
+        flushed.push({ size: byStop.size, deleteDates })
+        return flushDepartureDocs({
+          Departure,
+          feedId: 'mini',
+          dates,
+          byStop,
+          deleteDates,
+          nextPart
+        })
+      }
+    })
+    assert.ok(flushed.length >= 1)
+    assert.equal(flushed[0].deleteDates, true)
+    assert.ok(stopTimesWindow >= 1)
+    assert.ok(stopRouteAcc.get('A')?.has('R1'))
+    assert.equal(typeof Departure.inserted[0].deps[0], 'string')
   })
 })

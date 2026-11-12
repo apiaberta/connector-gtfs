@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import mongoose from 'mongoose'
 import cron from 'node-cron'
-import { PORT, MONGO_URI, SERVICE_NAME } from './config.js'
+import { PORT, MONGO_URI, SERVICE_NAME, INGEST_CRON, DEPARTURES_CRON } from './config.js'
 import { buildApp } from './app.js'
 import { runIngest, shouldIngestOnStartup } from './ingest/runner.js'
 import { ensureIndexes } from './models.js'
@@ -16,15 +16,15 @@ await ensureIndexes()
 const app = await buildApp()
 app.log.info('Connected to MongoDB')
 
-cron.schedule('30 3 * * *', () => {
-  app.log.info('Cron: full GTFS ingest')
+cron.schedule(INGEST_CRON, () => {
+  app.log.info({ cron: INGEST_CRON }, 'Cron: full GTFS ingest')
   runIngest('full', app.log)
     .then((r) => app.log.info({ r }, 'Full ingest complete'))
     .catch((err) => app.log.error({ err }, 'Full ingest failed'))
 }, { timezone: 'Europe/Lisbon' })
 
-cron.schedule('5 0 * * *', () => {
-  app.log.info('Cron: roll GTFS departure window')
+cron.schedule(DEPARTURES_CRON, () => {
+  app.log.info({ cron: DEPARTURES_CRON }, 'Cron: roll GTFS departure window')
   runIngest('departures', app.log)
     .then((r) => app.log.info({ r }, 'Departure roll complete'))
     .catch((err) => app.log.error({ err }, 'Departure roll failed'))

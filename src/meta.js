@@ -16,7 +16,7 @@ export async function metaRoutes(app) {
       connector: SERVICE_NAME,
       version: VERSION,
       description: 'Unified GTFS schedules for Portuguese operators',
-      update_freq: 'daily 03:30 Europe/Lisbon; departures roll at 00:05',
+      update_freq: 'daily 04:00 Europe/Lisbon; departures roll at 00:05',
       window_days: windowDays(),
       window,
       endpoints: [
