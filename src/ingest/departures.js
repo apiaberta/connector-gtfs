@@ -1,7 +1,8 @@
-import { HEAP_SOFT_LIMIT, DEPARTURE_SPLIT, DEPARTURE_WRITE_BATCH } from '../config.js'
+import { HEAP_SOFT_LIMIT, DEPARTURE_SPLIT, DEPARTURE_WRITE_BATCH, DEPARTURE_FLUSH_ROWS } from '../config.js'
 import { unionServices } from '../calendar.js'
-import { gtfsTimeToUtc } from '../time.js'
+import { packDep } from '../departures-read.js'
 import { streamZipCsv } from './zip.js'
+import { bulkInsert } from './swap.js'
 
 function heapUsed() {
   return process.memoryUsage().heapUsed
@@ -58,6 +59,16 @@ function representativeTrips(activeTrips) {
   return wanted
 }
 
+function noteStopRoute(acc, stopId, routeId) {
+  if (!acc || !routeId) return
+  let set = acc.get(stopId)
+  if (!set) {
+    set = new Set()
+    acc.set(stopId, set)
+  }
+  set.add(routeId)
+}
+
 export async function collectStopDepartures({ zipPath, activeTrips, dates, logger }) {
   const wanted = representativeTrips(activeTrips)
   const perDate = shouldSplitPasses(activeTrips, dates.length)
@@ -107,15 +118,24 @@ function mergeStopMaps(target, extra) {
   }
 }
 
-async function collectOnePass({ zipPath, activeTrips, wantedTrips, logger }) {
+async function collectOnePass({
+  zipPath,
+  activeTrips,
+  wantedTrips,
+  logger,
+  onFlush,
+  stopRouteAcc,
+  flushEvery = DEPARTURE_FLUSH_ROWS
+}) {
   const byStop = new Map()
   // trip_id → stop_id[] in encounter order (one trip per route, see wantedTrips)
   const routeSeq = wantedTrips ? new Map() : null
   let kept = 0
   let scanned = 0
+  let sinceFlush = 0
   let lastLog = Date.now()
 
-  const found = await streamZipCsv(zipPath, 'stop_times.txt', (row) => {
+  const found = await streamZipCsv(zipPath, 'stop_times.txt', async (row) => {
     scanned++
     const tripId = String(row.trip_id || '')
     if (routeSeq && wantedTrips.has(tripId)) {
@@ -136,13 +156,15 @@ async function collectOnePass({ zipPath, activeTrips, wantedTrips, logger }) {
       byDate = new Map()
       byStop.set(stopId, byDate)
     }
-    const packed = `${t}\t${tripId}`
+    const packed = packDep(t, tripId, trip.route_id)
     for (const date of trip.dates) {
       const list = byDate.get(date)
       if (list) list.push(packed)
       else byDate.set(date, [packed])
     }
+    noteStopRoute(stopRouteAcc, stopId, trip.route_id)
     kept++
+    sinceFlush++
 
     if (scanned % 250_000 === 0) {
       const used = heapUsed()
@@ -154,11 +176,17 @@ async function collectOnePass({ zipPath, activeTrips, wantedTrips, logger }) {
         throw new Error(`Heap ${Math.round(used / 1024 / 1024)}MB exceeded soft limit while streaming stop_times`)
       }
     }
+
+    if (onFlush && sinceFlush >= flushEvery) {
+      await onFlush(byStop)
+      sinceFlush = 0
+    }
   })
 
   if (!found) throw new Error('stop_times.txt missing from zip')
+  if (onFlush && byStop.size) await onFlush(byStop)
   logger?.info({ scanned, kept, stops: byStop.size, heapMB: Math.round(heapUsed() / 1024 / 1024) }, 'stop_times streamed')
-  return { byStop, routeSeq }
+  return { byStop, routeSeq, scanned, kept }
 }
 
 function routeStopsFromSeq(wanted, routeSeq) {
@@ -171,33 +199,18 @@ function routeStopsFromSeq(wanted, routeSeq) {
   return routeStops
 }
 
-function docsForPacked({ feedId, stopId, date, packed, activeTrips, routesById, routeSet }) {
-  const deps = []
-  for (const item of packed) {
-    const tab = item.indexOf('\t')
-    const t = item.slice(0, tab)
-    const tripId = item.slice(tab + 1)
-    const trip = activeTrips.get(tripId)
-    if (!trip) continue
-    const route = routesById.get(trip.route_id)
-    deps.push({
-      t,
-      ts: gtfsTimeToUtc(date, t),
-      trip_id: tripId,
-      route_id: trip.route_id,
-      route_short_name: route?.route_short_name || '',
-      headsign: trip.headsign || '',
-      direction_id: trip.direction_id
-    })
-    if (trip.route_id) routeSet.add(trip.route_id)
-  }
-  packed.length = 0
-  deps.sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0))
+function partKey(stopId, date) {
+  return `${stopId}\t${date}`
+}
+
+function chunkPacked({ feedId, stopId, date, packed, startPart = 0 }) {
+  const deps = packed.splice(0, packed.length)
+  if (!deps.length) return []
   if (deps.length <= DEPARTURE_SPLIT) {
-    return [{ feed_id: feedId, stop_id: stopId, date, part: 0, deps }]
+    return [{ feed_id: feedId, stop_id: stopId, date, part: startPart, deps }]
   }
   const docs = []
-  for (let i = 0, part = 0; i < deps.length; i += DEPARTURE_SPLIT, part++) {
+  for (let i = 0, part = startPart; i < deps.length; i += DEPARTURE_SPLIT, part++) {
     docs.push({
       feed_id: feedId,
       stop_id: stopId,
@@ -211,54 +224,49 @@ function docsForPacked({ feedId, stopId, date, packed, activeTrips, routesById, 
 
 /**
  * Yield one stop at a time and drop it from `byStop` immediately.
- * Never builds a whole-feed docs array.
+ * Never builds a whole-feed docs array. `deps` stay packed strings.
+ * `nextPart` continues part numbers across mid-stream flushes so the
+ * unique (feed_id, stop_id, date, part) index is not violated.
  */
-export function* iterStopDepartures({ feedId, byStop, activeTrips, routesById }) {
+export function* iterStopDepartures({ feedId, byStop, nextPart }) {
   const stopIds = [...byStop.keys()]
   for (const stopId of stopIds) {
     const byDate = byStop.get(stopId)
     byStop.delete(stopId)
-    const routeSet = new Set()
     const docs = []
     let stopTimes = 0
     for (const [date, packed] of byDate) {
-      const partDocs = docsForPacked({
-        feedId, stopId, date, packed, activeTrips, routesById, routeSet
-      })
+      const key = partKey(stopId, date)
+      const startPart = nextPart?.get(key) || 0
+      const partDocs = chunkPacked({ feedId, stopId, date, packed, startPart })
+      if (nextPart) nextPart.set(key, startPart + partDocs.length)
       stopTimes += partDocs.reduce((n, d) => n + d.deps.length, 0)
       docs.push(...partDocs)
     }
     byDate.clear()
-    yield { stopId, docs, routeIds: routeSet, stopTimes }
+    yield { stopId, docs, stopTimes }
   }
 }
 
 /**
- * Write departure docs as they are produced. insertMany batches of ~500.
+ * Write packed departure docs as they are produced, bulkWrite batches of ~500.
  * Releases each stop's packed rows before the next stop is expanded.
  */
 export async function flushDepartureDocs({
   Departure,
-  StopRoute,
   feedId,
   dates,
   byStop,
-  activeTrips,
-  routesById,
-  replaceLookups = true,
   deleteDates = true,
   batchSize = DEPARTURE_WRITE_BATCH,
+  nextPart,
   onBatch
 }) {
   if (deleteDates && dates?.length) {
     await Departure.deleteMany({ feed_id: feedId, date: { $in: dates } })
   }
-  if (replaceLookups && StopRoute) {
-    await StopRoute.deleteMany({ feed_id: feedId })
-  }
 
   const depBatch = []
-  const srBatch = []
   let stopTimesWindow = 0
   let maxBatch = 0
 
@@ -266,37 +274,22 @@ export async function flushDepartureDocs({
     if (!depBatch.length) return
     maxBatch = Math.max(maxBatch, depBatch.length)
     onBatch?.(depBatch.length)
-    await Departure.insertMany(depBatch, { ordered: false })
-    depBatch.length = 0
+    const chunk = depBatch.splice(0, depBatch.length)
+    await bulkInsert(Departure, chunk)
   }
 
-  async function flushSr() {
-    if (!srBatch.length || !StopRoute) return
-    await StopRoute.insertMany(srBatch, { ordered: false })
-    srBatch.length = 0
-  }
-
-  for (const item of iterStopDepartures({ feedId, byStop, activeTrips, routesById })) {
+  for (const item of iterStopDepartures({ feedId, byStop, nextPart })) {
     stopTimesWindow += item.stopTimes
     if (depBatch.length >= batchSize) await flushDeps()
     depBatch.push(...item.docs)
-    if (replaceLookups && StopRoute) {
-      srBatch.push({
-        feed_id: feedId,
-        stop_id: item.stopId,
-        route_ids: [...item.routeIds]
-      })
-      if (srBatch.length >= batchSize) await flushSr()
-    }
   }
   await flushDeps()
-  await flushSr()
   return { stopTimesWindow, maxBatch }
 }
 
 /**
  * Collect stop_times (optionally one date at a time) and flush each pass
- * immediately so two window days are never expanded together.
+ * in DEPARTURE_FLUSH_ROWS chunks so a Carris-sized day is never all resident.
  */
 export async function buildAndFlushDepartures({
   zipPath,
@@ -312,6 +305,8 @@ export async function buildAndFlushDepartures({
   let routeStops = []
   let stopTimesWindow = 0
   let first = true
+  const stopRouteAcc = replaceLookups ? new Map() : null
+  const nextPart = new Map()
 
   for (const group of groups) {
     const slice = perDate
@@ -320,25 +315,30 @@ export async function buildAndFlushDepartures({
     if (perDate) {
       logger?.info({ trips: slice.size, date: group[0] }, 'stop_times: one pass per date (heap guard)')
     }
+    let deleteDates = true
     const part = await collectOnePass({
       zipPath,
       activeTrips: slice,
       wantedTrips: first ? new Set(wanted.values()) : null,
-      logger
+      logger,
+      stopRouteAcc,
+      onFlush: async (byStop) => {
+        const r = await flush({
+          byStop,
+          dates: group,
+          deleteDates,
+          nextPart
+        })
+        stopTimesWindow += r.stopTimesWindow
+        deleteDates = false
+      }
     })
-    const r = await flush({
-      byStop: part.byStop,
-      dates: group,
-      deleteDates: true,
-      replaceLookups: first && replaceLookups
-    })
-    stopTimesWindow += r.stopTimesWindow
     if (part.routeSeq) routeStops = routeStopsFromSeq(wanted, part.routeSeq)
     part.byStop.clear()
     first = false
   }
 
-  return { stopTimesWindow, routeStops }
+  return { stopTimesWindow, routeStops, stopRouteAcc }
 }
 
 export function filterTripsForDate(activeTrips, date) {
@@ -356,4 +356,13 @@ export function tripsPerRoute(activeTrips, date) {
     counts[trip.route_id] = (counts[trip.route_id] || 0) + 1
   }
   return counts
+}
+
+export function stopRouteDocs(feedId, stopRouteAcc) {
+  if (!stopRouteAcc?.size) return []
+  const docs = []
+  for (const [stop_id, ids] of stopRouteAcc) {
+    docs.push({ feed_id: feedId, stop_id, route_ids: [...ids] })
+  }
+  return docs
 }

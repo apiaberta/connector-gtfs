@@ -7,19 +7,21 @@ import { enabledFeeds } from '../feeds.js'
 import { resolveFeedUrl } from '../discovery.js'
 import { lisbonYmd, yyyymmddToIso } from '../time.js'
 import { windowDates } from '../window.js'
-import { servicesByDate } from '../calendar.js'
+import {
+  addCalendarToServices, addCalendarDateToServices, emptyByDate, unionServices
+} from '../calendar.js'
 import { diffFeed } from '../diff.js'
 import {
   Feed, FeedVersion, Change, Agency, Route, Stop, Trip,
   Calendar, CalendarDate, Departure, StopRoute, RouteStop, ensureIndexes
 } from '../models.js'
-import { listZipEntries, validateGtfsZip, collectZipCsv, streamZipCsv, zipHasFile } from './zip.js'
+import { listZipEntries, validateGtfsZip, collectZipCsv, streamZipCsv, zipBasename } from './zip.js'
 import { downloadZip, sha256File, zipPathFor } from './download.js'
 import {
-  tripFromRow, indexActiveTrips, buildAndFlushDepartures,
-  flushDepartureDocs, filterTripsForDate, tripsPerRoute
+  tripFromRow, buildAndFlushDepartures,
+  flushDepartureDocs, filterTripsForDate, tripsPerRoute, stopRouteDocs
 } from './departures.js'
-import { replaceByFeed, pruneOlderThan } from './swap.js'
+import { replaceByFeed, createBatchWriter, pruneOlderThan } from './swap.js'
 
 function num(v, fallback = null) {
   if (v == null || v === '') return fallback
@@ -97,58 +99,90 @@ function mapCalendarDate(feedId, row) {
   }
 }
 
-async function loadStatic(zipPath, feedId) {
-  const [agencyRows, stopRows, routeRows, calRows, calDateRows, infoRows] = await Promise.all([
-    collectZipCsv(zipPath, 'agency.txt'),
-    collectZipCsv(zipPath, 'stops.txt'),
-    collectZipCsv(zipPath, 'routes.txt'),
-    collectZipCsv(zipPath, 'calendar.txt'),
-    collectZipCsv(zipPath, 'calendar_dates.txt'),
-    zipHasFile(zipPath, 'feed_info.txt').then((ok) => (ok ? collectZipCsv(zipPath, 'feed_info.txt') : []))
-  ])
+function noteRange(d, acc) {
+  if (!d) return
+  if (!acc.from || d < acc.from) acc.from = d
+  if (!acc.to || d > acc.to) acc.to = d
+}
 
-  const agencies = agencyRows.map((r) => mapAgency(feedId, r))
-  const stops = stopRows.filter((r) => r.stop_id).map((r) => mapStop(feedId, r))
-  const routes = routeRows.filter((r) => r.route_id).map((r) => mapRoute(feedId, r))
-  const calendars = calRows.filter((r) => r.service_id).map((r) => mapCalendar(feedId, r))
-  const calendarDates = calDateRows.filter((r) => r.service_id).map((r) => mapCalendarDate(feedId, r))
-
-  let valid_from = yyyymmddToIso(infoRows[0]?.feed_start_date)
-  let valid_to = yyyymmddToIso(infoRows[0]?.feed_end_date)
-  if (!valid_from || !valid_to) {
-    const dates = []
-    for (const c of calendars) {
-      if (c.start_date) dates.push(c.start_date)
-      if (c.end_date) dates.push(c.end_date)
-    }
-    for (const c of calendarDates) if (c.date) dates.push(c.date)
-    dates.sort()
-    if (!valid_from) valid_from = dates[0] || null
-    if (!valid_to) valid_to = dates[dates.length - 1] || null
+async function loadFeedInfo(zipPath, entries) {
+  const has = entries.some((n) => zipBasename(n) === 'feed_info.txt')
+  if (!has) return { valid_from: null, valid_to: null }
+  const rows = await collectZipCsv(zipPath, 'feed_info.txt')
+  return {
+    valid_from: yyyymmddToIso(rows[0]?.feed_start_date),
+    valid_to: yyyymmddToIso(rows[0]?.feed_end_date)
   }
+}
 
-  return { agencies, stops, routes, calendars, calendarDates, valid_from, valid_to }
+async function streamReplace(Model, feedId, zipPath, fileName, mapRow, onDoc) {
+  await Model.deleteMany({ feed_id: feedId })
+  const writer = createBatchWriter(Model)
+  let count = 0
+  await streamZipCsv(zipPath, fileName, async (row) => {
+    const doc = mapRow(row)
+    if (!doc) return
+    onDoc?.(doc)
+    await writer.push(doc)
+    count++
+  })
+  await writer.flush()
+  return count
+}
+
+async function loadCalendars(zipPath, feedId, dates, persist, range) {
+  const byDate = emptyByDate(dates)
+  const calRange = { from: null, to: null }
+  if (persist) await Calendar.deleteMany({ feed_id: feedId })
+  const calWriter = persist ? createBatchWriter(Calendar) : null
+  await streamZipCsv(zipPath, 'calendar.txt', async (row) => {
+    if (!row.service_id) return
+    const doc = mapCalendar(feedId, row)
+    addCalendarToServices(doc, dates, byDate)
+    noteRange(doc.start_date, calRange)
+    noteRange(doc.end_date, calRange)
+    if (calWriter) await calWriter.push(doc)
+  })
+  if (calWriter) await calWriter.flush()
+
+  if (persist) await CalendarDate.deleteMany({ feed_id: feedId })
+  const dateWriter = persist ? createBatchWriter(CalendarDate) : null
+  await streamZipCsv(zipPath, 'calendar_dates.txt', async (row) => {
+    if (!row.service_id) return
+    const doc = mapCalendarDate(feedId, row)
+    addCalendarDateToServices(doc, byDate)
+    noteRange(doc.date, calRange)
+    if (dateWriter) await dateWriter.push(doc)
+  })
+  if (dateWriter) await dateWriter.flush()
+  if (!range.from) range.from = calRange.from
+  if (!range.to) range.to = calRange.to
+  return byDate
 }
 
 async function loadWindowTrips(zipPath, feedId, byDate) {
-  const active = new Set()
-  for (const set of byDate.values()) for (const id of set) active.add(id)
-  const trips = []
-  await streamZipCsv(zipPath, 'trips.txt', (row) => {
+  const active = unionServices(byDate)
+  const activeTrips = new Map()
+  await Trip.deleteMany({ feed_id: feedId })
+  const writer = createBatchWriter(Trip)
+  await streamZipCsv(zipPath, 'trips.txt', async (row) => {
     const trip = tripFromRow(row)
     if (!trip.trip_id || !active.has(String(trip.service_id))) return
-    trips.push({ feed_id: feedId, ...trip })
+    const dates = []
+    for (const [ymd, set] of byDate) {
+      if (set.has(String(trip.service_id))) dates.push(ymd)
+    }
+    if (!dates.length) return
+    activeTrips.set(String(trip.trip_id), {
+      route_id: trip.route_id,
+      headsign: trip.headsign || '',
+      direction_id: trip.direction_id,
+      dates
+    })
+    await writer.push({ feed_id: feedId, ...trip })
   })
-  return trips
-}
-
-async function persistTables(feedId, { agencies, stops, routes, calendars, calendarDates, trips }) {
-  await replaceByFeed(Agency, feedId, agencies)
-  await replaceByFeed(Route, feedId, routes)
-  await replaceByFeed(Stop, feedId, stops)
-  await replaceByFeed(Calendar, feedId, calendars)
-  await replaceByFeed(CalendarDate, feedId, calendarDates)
-  await replaceByFeed(Trip, feedId, trips)
+  await writer.flush()
+  return { activeTrips, tripCount: activeTrips.size }
 }
 
 function slimSnapshot({ stops, routes, trips_per_route, valid_from, valid_to }) {
@@ -220,7 +254,7 @@ export async function ingestFeed(feed, { mode = 'full', logger } = {}) {
 
   if (mode === 'full' && unchanged && prev) {
     const lastDate = dates[dates.length - 1]
-    const haveWindow = await Departure.findOne({ feed_id: feed.id, date: lastDate }).lean()
+    const haveWindow = await Departure.findOne({ feed_id: feed.id, date: lastDate }).select({ _id: 1 }).lean()
     if (haveWindow) {
       logger?.info({ feed: feed.id }, 'Zip unchanged')
       const expired = Boolean(prev.valid_to && prev.valid_to < today)
@@ -238,32 +272,46 @@ export async function ingestFeed(feed, { mode = 'full', logger } = {}) {
     logger?.info({ feed: feed.id, lastDate }, 'Zip unchanged but window incomplete — rebuilding departures')
   }
 
-  const staticTables = await loadStatic(destPath, feed.id)
-  const byDate = servicesByDate(dates, staticTables.calendars, staticTables.calendarDates)
-  const trips = await loadWindowTrips(destPath, feed.id, byDate)
-  const tripCount = trips.length
-  const activeTrips = indexActiveTrips(trips, byDate)
-  const routesById = new Map(staticTables.routes.map((r) => [r.route_id, r]))
-  const stopCount = staticTables.stops.length
-  const routeCount = staticTables.routes.length
-  const nextSnap = slimSnapshot({
-    stops: staticTables.stops,
-    routes: staticTables.routes,
-    trips_per_route: tripsPerRoute(activeTrips, dates[0]),
-    valid_from: staticTables.valid_from,
-    valid_to: staticTables.valid_to
-  })
+  const info = await loadFeedInfo(destPath, entries)
+  const range = { from: info.valid_from, to: info.valid_to }
+
+  const slimStops = []
+  const slimRoutes = []
+  let stopCount = prev?.counts?.stops ?? 0
+  let routeCount = prev?.counts?.routes ?? 0
 
   if (reloadTables) {
-    await persistTables(feed.id, { ...staticTables, trips })
-  } else {
-    await replaceByFeed(Trip, feed.id, trips)
+    await streamReplace(Agency, feed.id, destPath, 'agency.txt', (row) => mapAgency(feed.id, row))
+    stopCount = await streamReplace(
+      Stop, feed.id, destPath, 'stops.txt',
+      (row) => (row.stop_id ? mapStop(feed.id, row) : null),
+      (doc) => slimStops.push({ stop_id: doc.stop_id })
+    )
+    routeCount = await streamReplace(
+      Route, feed.id, destPath, 'routes.txt',
+      (row) => (row.route_id ? mapRoute(feed.id, row) : null),
+      (doc) => slimRoutes.push({
+        route_id: doc.route_id,
+        route_short_name: doc.route_short_name,
+        route_long_name: doc.route_long_name
+      })
+    )
   }
-  staticTables.agencies = null
-  staticTables.stops = null
-  staticTables.calendars = null
-  staticTables.calendarDates = null
-  staticTables.routes = null
+
+  const byDate = await loadCalendars(destPath, feed.id, dates, reloadTables, range)
+  const { activeTrips, tripCount } = await loadWindowTrips(destPath, feed.id, byDate)
+
+  const valid_from = range.from
+  const valid_to = range.to
+  const nextSnap = reloadTables
+    ? slimSnapshot({
+      stops: slimStops,
+      routes: slimRoutes,
+      trips_per_route: tripsPerRoute(activeTrips, dates[0]),
+      valid_from,
+      valid_to
+    })
+    : null
 
   const incremental = mode === 'departures' && prev
   const targetDates = incremental ? [dates[dates.length - 1]] : dates
@@ -275,26 +323,26 @@ export async function ingestFeed(feed, { mode = 'full', logger } = {}) {
     await Departure.deleteMany({ feed_id: feed.id, date: { $lt: dates[0] } })
   }
 
-  const { stopTimesWindow, routeStops } = await buildAndFlushDepartures({
+  const { stopTimesWindow, routeStops, stopRouteAcc } = await buildAndFlushDepartures({
     zipPath: destPath,
     activeTrips: tripsForDates,
     dates: targetDates,
     logger,
     replaceLookups: reloadTables,
-    flush: ({ byStop, dates: passDates, deleteDates, replaceLookups }) =>
+    flush: ({ byStop, dates: passDates, deleteDates, nextPart }) =>
       flushDepartureDocs({
         Departure,
-        StopRoute,
         feedId: feed.id,
         dates: passDates,
         byStop,
-        activeTrips,
-        routesById,
-        replaceLookups,
-        deleteDates
+        deleteDates,
+        nextPart
       })
   })
 
+  if (reloadTables && stopRouteAcc?.size) {
+    await replaceByFeed(StopRoute, feed.id, stopRouteDocs(feed.id, stopRouteAcc))
+  }
   if (reloadTables && routeStops.length) {
     await replaceByFeed(RouteStop, feed.id, routeStops.map((r) => ({ feed_id: feed.id, ...r })))
   }
@@ -307,11 +355,11 @@ export async function ingestFeed(feed, { mode = 'full', logger } = {}) {
   }
 
   let summary = { unchanged: true }
-  if (reloadTables || !prev) {
+  if ((reloadTables || !prev) && nextSnap) {
     summary = await writeDiffAndVersion(feed, sha256, nextSnap, now)
   }
 
-  const expired = Boolean(staticTables.valid_to && staticTables.valid_to < today)
+  const expired = Boolean(valid_to && valid_to < today)
   await Feed.findOneAndUpdate(
     { feed_id: feed.id },
     {
@@ -327,8 +375,8 @@ export async function ingestFeed(feed, { mode = 'full', logger } = {}) {
         last_modified: download.last_modified || prev?.last_modified || null,
         sha256,
         bytes: download.bytes || prev?.bytes || null,
-        valid_from: staticTables.valid_from,
-        valid_to: staticTables.valid_to,
+        valid_from: valid_from ?? prev?.valid_from ?? null,
+        valid_to: valid_to ?? prev?.valid_to ?? null,
         expired,
         counts,
         last_checked: now,

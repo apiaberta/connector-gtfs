@@ -125,20 +125,18 @@ const calendarDateSchema = new Schema({
 }, { collection: 'calendar_dates' })
 calendarDateSchema.index({ feed_id: 1, service_id: 1 })
 
+/**
+ * `deps` is Mixed so packed strings ("t\\ttrip_id\\troute_id") and the
+ * pre-1.1 object shape can coexist. Next ingest deletes the window dates
+ * and rewrites packed docs. No new indexes — unique (feed_id, stop_id, date, part)
+ * and { date: 1 } stay as they are.
+ */
 const departureSchema = new Schema({
   feed_id: { type: String, required: true },
   stop_id: { type: String, required: true },
   date: { type: String, required: true },
   part: { type: Number, default: 0 },
-  deps: [{
-    t: String,
-    ts: Date,
-    trip_id: String,
-    route_id: String,
-    route_short_name: String,
-    headsign: String,
-    direction_id: Number
-  }]
+  deps: { type: [Schema.Types.Mixed], default: [] }
 }, { collection: 'departures' })
 departureSchema.index({ feed_id: 1, stop_id: 1, date: 1, part: 1 }, { unique: true })
 departureSchema.index({ date: 1 })

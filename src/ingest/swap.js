@@ -1,5 +1,34 @@
 import { WRITE_BATCH } from '../config.js'
 
+export async function bulkInsert(Model, docs) {
+  if (!docs?.length) return
+  const chunk = docs
+  await Model.bulkWrite(
+    chunk.map((document) => ({ insertOne: { document } })),
+    { ordered: false }
+  )
+}
+
+export function createBatchWriter(Model, batchSize = WRITE_BATCH) {
+  let batch = []
+  return {
+    async push(doc) {
+      batch.push(doc)
+      if (batch.length >= batchSize) {
+        const chunk = batch
+        batch = []
+        await bulkInsert(Model, chunk)
+      }
+    },
+    async flush() {
+      if (!batch.length) return
+      const chunk = batch
+      batch = []
+      await bulkInsert(Model, chunk)
+    }
+  }
+}
+
 export async function replaceByFeed(Model, feedId, docs, extraFilter = {}) {
   await Model.deleteMany({ feed_id: feedId, ...extraFilter })
   await insertBatches(Model, docs)
@@ -9,7 +38,7 @@ export async function insertBatches(Model, docs) {
   for (let i = 0; i < docs.length; i += WRITE_BATCH) {
     const chunk = docs.slice(i, i + WRITE_BATCH)
     if (chunk.length) {
-      await Model.insertMany(chunk, { ordered: false })
+      await bulkInsert(Model, chunk)
     }
   }
 }
