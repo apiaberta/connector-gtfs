@@ -14,8 +14,8 @@ describe('cron and heap defaults', () => {
     assert.equal(DEPARTURES_CRON, '5 0 * * *')
   })
 
-  it('bumps the connector to 1.1.0', () => {
-    assert.equal(VERSION, '1.1.0')
+  it('bumps the connector to 1.1.1', () => {
+    assert.equal(VERSION, '1.1.1')
   })
 
   it('keeps API heap and NODE_OPTIONS at 192, ingest child at 384', () => {

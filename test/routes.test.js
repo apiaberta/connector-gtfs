@@ -59,7 +59,7 @@ describe('HTTP routes', () => {
     const body = res.json()
     assert.equal(body.status, 'ok')
     assert.equal(body.service, 'connector-gtfs')
-    assert.equal(body.version, '1.1.0')
+    assert.equal(body.version, '1.1.1')
   })
 
   it('GET /gtfs/meta lists the 04:00 ingest', async () => {
@@ -68,7 +68,7 @@ describe('HTTP routes', () => {
     const body = res.json()
     assert.match(body.update_freq, /04:00/)
     assert.match(body.update_freq, /00:05/)
-    assert.equal(body.version, '1.1.0')
+    assert.equal(body.version, '1.1.1')
   })
 
   it('GET /gtfs/feeds', async () => {

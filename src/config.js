@@ -7,7 +7,7 @@ if (existsSync(envPath)) {
 }
 
 export const SERVICE_NAME = 'connector-gtfs'
-export const VERSION = '1.1.0'
+export const VERSION = '1.1.1'
 export const USER_AGENT = 'apiaberta.pt/1.0 (open-data connector)'
 export const TIMEZONE = 'Europe/Lisbon'
 
@@ -25,7 +25,6 @@ export const WRITE_BATCH = 1000
 export const DEPARTURE_WRITE_BATCH = 500
 export const DEPARTURE_SPLIT = 5000
 export const DEPARTURE_FLUSH_ROWS = 40_000
-export const ZIP_RETENTION_MS = 3 * 24 * 60 * 60 * 1000
 export const HEAP_SOFT_LIMIT = 280 * 1024 * 1024
 export const STARTUP_MAX_AGE_MS = 24 * 60 * 60 * 1000
 export const FEED_VERSIONS_KEEP = 30

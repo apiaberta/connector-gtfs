@@ -1,7 +1,6 @@
-import { mkdir, readdir, stat, unlink } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, stat } from 'node:fs/promises'
 import {
-  TMP_DIR, FEED_VERSIONS_KEEP, ZIP_RETENTION_MS
+  TMP_DIR, FEED_VERSIONS_KEEP
 } from '../config.js'
 import { enabledFeeds } from '../feeds.js'
 import { resolveFeedUrl } from '../discovery.js'
@@ -16,7 +15,7 @@ import {
   Calendar, CalendarDate, Departure, StopRoute, RouteStop, ensureIndexes
 } from '../models.js'
 import { listZipEntries, validateGtfsZip, collectZipCsv, streamZipCsv, zipBasename } from './zip.js'
-import { downloadZip, sha256File, zipPathFor } from './download.js'
+import { cleanupFeedParts, downloadZip, sha256File, zipPathFor } from './download.js'
 import {
   tripFromRow, buildAndFlushDepartures,
   flushDepartureDocs, filterTripsForDate, tripsPerRoute, stopRouteDocs
@@ -229,6 +228,7 @@ export async function ingestFeed(feed, { mode = 'full', logger } = {}) {
   const now = new Date()
 
   const discovered = await resolveFeedUrl(feed)
+  await cleanupFeedParts(TMP_DIR, feed.id, logger)
   let download
   try {
     download = await downloadZip(discovered.url, destPath, {
@@ -237,12 +237,24 @@ export async function ingestFeed(feed, { mode = 'full', logger } = {}) {
       logger
     })
   } catch (err) {
-    if (prev?.sha256) {
+    const cached = await stat(destPath).catch(() => null)
+    if (prev?.sha256 && cached) {
       logger?.warn({ err, feed: feed.id }, 'Download failed, using cached zip')
-      download = { notModified: true, destPath, bytes: prev.bytes, etag: prev.etag, last_modified: prev.last_modified }
+      download = {
+        notModified: true,
+        destPath,
+        bytes: cached.size,
+        etag: prev.etag,
+        last_modified: prev.last_modified
+      }
     } else {
       throw err
     }
+  }
+
+  const local = await stat(destPath).catch(() => null)
+  if (!local) {
+    throw new Error(`GTFS zip missing after download: ${destPath}`)
   }
 
   const sha256 = download.sha256 || await sha256File(destPath)
@@ -396,25 +408,6 @@ export async function ingestFeed(feed, { mode = 'full', logger } = {}) {
   }
 }
 
-export async function cleanupOldZips(logger) {
-  let names
-  try {
-    names = await readdir(TMP_DIR)
-  } catch {
-    return
-  }
-  const cutoff = Date.now() - ZIP_RETENTION_MS
-  for (const name of names) {
-    if (!name.endsWith('.zip')) continue
-    const p = join(TMP_DIR, name)
-    const s = await stat(p).catch(() => null)
-    if (s && s.mtimeMs < cutoff) {
-      await unlink(p).catch(() => {})
-      logger?.info({ p }, 'Deleted old zip')
-    }
-  }
-}
-
 export async function runPipeline({ mode = 'full', logger } = {}) {
   await ensureIndexes()
   const feeds = enabledFeeds()
@@ -432,8 +425,9 @@ export async function runPipeline({ mode = 'full', logger } = {}) {
         { $set: { last_error: err.message, last_checked: new Date() } }
       ).catch(() => {})
       results.push({ feed_id: feed.id, status: 'error', error: err.message })
+    } finally {
+      await cleanupFeedParts(TMP_DIR, feed.id, logger)
     }
   }
-  await cleanupOldZips(logger)
   return { mode, results }
 }
