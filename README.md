@@ -9,6 +9,7 @@ Gateway prefix: `/gtfs`. Port **3018**. Database `apiaberta-gtfs`. pm2 name `api
 - Daily ingest at `0 4 * * *` Europe/Lisbon in a forked child (`--max-old-space-size=384`, 20 min timeout). 04:00 avoids overlapping connector-geo’s 03:30 sync.
 - Departure window roll at `5 0 * * *`
 - Streaming unzip (`yauzl`) + CSV (`csv-parse`) — `stop_times.txt` is never loaded into memory or extracted to disk
+- One zip cache per feed (`/tmp/apiaberta-gtfs/<feed_id>.zip`). Downloads write to a `.part` and rename after `finish`. 304 is only used when that file exists (otherwise a full GET). Cleanup removes leftover `.part` files for that feed only — it does not sweep other operators’ zips.
 - Static tables and trips are stream-parsed and written with `bulkWrite` batches (1000); departures flush every 40 000 stop_times rows
 - Per-feed `expired` flag when `valid_to` is before today
 - No shapes or fares in v1
